@@ -1,0 +1,219 @@
+SPAN_MAX = 8
+SPAN_LEN = np.arange(SPAN_MAX) + 1
+SPAN_LEN
+
+SPAN_WEIGHT = 1 / SPAN_LEN
+SPAN_WEIGHT
+
+SPAN_PROB = SPAN_WEIGHT / np.sum(SPAN_WEIGHT)
+SPAN_PROB
+
+print(f"평균 mask 길이: {np.sum(SPAN_LEN * SPAN_PROB)}")
+
+
+def get_span_length():
+    """
+    random span 길이를 구하는 함수
+    :return: span 길이
+    """
+    return np.random.choice(SPAN_LEN, 1, p=SPAN_PROB)[0]
+
+
+
+def create_pretrain_mask(tokens, mask_cnt):
+    """
+    마스크 생성
+    :param tokens: tokens
+    :param mask_cnt: mask 개수 (전체 tokens의 15%)
+    :return enc_input: encoder input tokens
+    :return dec_input: decoder input tokens
+    """
+    cand_idx = {}  # word 단위의 index dict
+    masks = []  # mask 된 값을 기록하기 위한 array
+    index = 0
+    for (i, token) in enumerate(tokens):
+        masks.append(None)
+        index += 1
+        cand_idx[index] = [i]
+        # if 0 < len(cand_idx) and not token.startswith(u"\u2581"):
+        #     cand_idx[index].append(i)
+        # else:
+        #     index += 1
+        #     cand_idx[index] = [i]
+    
+    keys = list(cand_idx.keys())
+    random.shuffle(keys)
+
+    mask_lms = []  # mask 된 값
+    covered_idx = set()  # 중복 mask 방지를 위해 mask값 기록
+    for index in keys:
+        if len(mask_lms) >= mask_cnt:  # 현재 mask된 개수가 15%를 넘으면 중지
+            break
+        span_len = get_span_length()
+        if len(cand_idx) <= index + span_len:  # index 뒤로 남은 개수가 span_len보다 작으면 skip
+            continue
+        # mask할 토큰의 index 저장
+        index_set = []
+        for i in range(span_len):
+            index_set.extend(cand_idx[index + i])
+        if len(mask_lms) + len(index_set) > mask_cnt:  # 이번에 mask할 개수를 포함해 15%를 넘으면 skip
+            continue
+        # 이미 마스크 된 경우가 있는지 확인
+        is_idx_covered = False
+        for index in index_set:
+            if index in covered_idx:
+                is_idx_covered = True
+                break
+        if is_idx_covered:
+            continue
+        # mask 실행
+        for index in index_set:
+            covered_idx.add(index)
+            masked_token = None
+            mask_lms.append({'index': index, 'label': tokens[index]})
+            masks[index] = tokens[index]
+            tokens[index] = masked_token
+
+    mask_lms = sorted(mask_lms, key=lambda x: x["index"])
+
+    enc_token, dec_token = [], []
+    is_mask = False
+    for i, token in enumerate(tokens):
+        if is_mask:
+            if token is None:
+                dec_token.append(masks[i])
+            else:
+                enc_token.append(token)
+                is_mask = False
+        else:
+            if token is None:
+                enc_token.append('[MASK]')
+                dec_token.append('[MASK]')
+                dec_token.append(masks[i])
+                is_mask = True
+            else:
+                enc_token.append(token)
+
+    if 0 < len(dec_token):
+        dec_token.append('[SEP]')
+
+    return enc_token, dec_token
+
+
+def make_instances(vocab, doc, n_seq, mask_prob):
+    """
+    doc별 pretrain 데이터 생성
+    """
+    max_seq = n_seq
+
+    instances = []
+
+    chunk = []
+    chunk_len = 0
+    for i, line in enumerate(doc):
+        tokens = vocab.encode_as_pieces(line)
+        if tokens:
+            chunk.append(tokens)
+            chunk_len += len(tokens)
+        if 0 < len(chunk) and (i == len(doc) - 1 or chunk_len >= max_seq):  # 마지막 줄 이거나 길이가 max_seq 이상 인 경우
+            tokens = []
+            for j in range(len(chunk)):
+                tokens.extend(chunk[j])
+
+            # max_seq 보다 큰 경우 길이 조절
+            tokens = tokens[:max_seq]
+            assert 0 < len(tokens)
+
+            # mask
+            enc_token, dec_token = create_pretrain_mask(tokens, int(len(tokens) * mask_prob))
+            if len(dec_token) > 0:
+                instance = {
+                    "enc_token": enc_token,
+                    "dec_token": dec_token
+                }
+                instances.append(instance)
+
+            chunk = []
+            chunk_len = 0
+
+    return instances
+
+
+def make_tfrecord(vocab, instance, n_enc, n_dec):
+    enc_token = vocab.piece_to_id(instance['enc_token'])
+    enc_token += [0] * (n_enc - len(enc_token))
+    value = vocab.piece_to_id(instance['dec_token'])
+    dec_token = [vocab.bos_id()] + value
+    dec_token += [0] * (n_dec - len(dec_token))
+    dec_label = value + [vocab.eos_id()]
+    dec_label += [0] * (n_dec - len(dec_label))
+
+    assert len(enc_token) == n_enc
+    assert len(dec_token) == len(dec_label) == n_dec
+
+    # store value
+    feature = {
+        'enc_token': tf.train.Feature(int64_list=tf.train.Int64List(value=enc_token)),
+        'dec_token': tf.train.Feature(int64_list=tf.train.Int64List(value=dec_token)),
+        'dec_label': tf.train.Feature(int64_list=tf.train.Int64List(value=dec_label)),
+    }
+    features = tf.train.Features(feature=feature)
+    example = tf.train.Example(features=features)
+
+    return example
+
+
+
+
+count = 0
+options = tf.io.TFRecordOptions(compression_type='GZIP')
+with tf.io.TFRecordWriter('t5-128.tfrecords', options=options) as writer:
+    for _ in range(1):
+        doc = []
+        with zipfile.ZipFile(kowiki_file) as z:
+            with z.open('kowiki.txt') as f:
+                for i, line in enumerate(tqdm(f, total=total)):
+                    line = line.decode('utf-8').strip()
+                    if line:
+                        doc.append(line)
+                    else:
+                        if doc:
+                            instances = make_instances(vocab, doc, 128, 0.15)
+                            for instance in instances:
+                                example = make_tfrecord(vocab, instance, n_enc, n_dec)
+                                writer.write(example.SerializeToString())
+                                count += 1
+                        doc = []
+            if doc:
+                instances = make_instances(vocab, doc, 128, 0.15)
+                for instance in instances:
+                    example = make_tfrecord(vocab, instance, n_enc, n_dec)
+                    writer.write(example.SerializeToString())
+                    count += 1
+
+count
+
+
+
+class InverseSquareRootSchedule(tf.keras.optimizers.schedules.LearningRateSchedule):
+    """
+    TransformerSchedule class
+    """
+    def __init__(self, warmup_steps=10000):
+        """
+        생성자
+        :param warmup_steps: warmup steps
+        """
+        super().__init__()
+
+        self.warmup_steps = warmup_steps
+
+    def __call__(self, step_num):
+        """
+        learning rate 계산
+        :param step_num: 현재 step number
+        :retrun: 계산된 learning rate
+        """
+        arg = tf.math.maximum(step_num, self.warmup_steps)
+        lr = tf.math.rsqrt(arg) * 0.01
+        return lr

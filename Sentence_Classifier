@@ -1,0 +1,70 @@
+def make_data(sentences, targets, n_seq=4):
+    tokens, labels = [], []
+
+    for sentence, target in zip(sentences, targets):
+        token = [word_to_id[w] for w in sentence.split()]
+        token = token[:n_seq]
+        token += [0] * (n_seq - len(token))
+        tokens.append(token)
+
+        labels.append(target)
+
+    tokens = np.array(tokens)
+    labels = np.array(labels)
+    
+    return tokens, labels
+
+
+class SentenceClassifier(tf.keras.Model):
+    """
+    SentenceClassifier Class
+    """
+    def __init__(self, args, name='sentence_classifier'):
+        """
+        생성자
+        :param args: Args 객체
+        :param name: layer name
+        """
+        super().__init__(name=name)
+
+        self.embedding = tf.keras.layers.Embedding(args.n_vocab, args.d_model)
+        self.pooling = tf.keras.layers.GlobalMaxPooling1D()
+        self.linear = tf.keras.layers.Dense(args.n_out)
+
+    def call(self, inputs, training=False):
+        """
+        layer 실행
+        :param inputs: tokens
+        :return y_pred: tokens 예측 결과
+        """
+        tokens = inputs
+
+        hidden = self.embedding(tokens)
+        hidden = self.pooling(hidden)
+        logits = self.linear(hidden)
+
+        return logits
+
+
+# load vocab
+vocab = spm.SentencePieceProcessor()
+vocab.load(os.path.join(data_dir, "kowiki", "kowiki_32000.model"))
+
+
+# with spm
+def make_data(sentences, targets, n_seq=6):
+    tokens, labels = [], []
+
+    for sentence, target in zip(sentences, targets):
+        token = vocab.encode_as_ids(sentence)
+        token = token[:n_seq]
+        token += [0] * (n_seq - len(token))
+        tokens.append(token)
+
+        labels.append(target)
+
+    tokens = np.array(tokens)
+    labels = np.array(labels)
+    
+    return tokens, labels
+

@@ -1,0 +1,741 @@
+- 
+    
+    ```python
+    class T5(tf.keras.Model):
+        """
+        T5 Class
+        """
+        def __init__(self, args, name='T5'):
+            """
+            생성자
+            :param args: Args 객체
+            :param name: layer name
+            """
+            super().__init__(name=name)
+    
+            self.i_pad = args.i_pad
+            self.embedding = SharedEmbedding(args)
+            self.position = PositionalEmbedding(args)
+            
+            self.encoder_layers = [EncoderLayer(args, name=f'encoder_layer_{i}') for i in range(args.n_layer)]
+            self.decoder_layers = [DecoderLayer(args, name=f'decoder_layer_{i}') for i in range(args.n_layer)]
+    
+            self.dropout = tf.keras.layers.Dropout(args.dropout)
+    
+        def call(self, inputs, training=False):
+            """
+            layer 실행
+            :param inputs: enc_tokens, dec_tokens
+            :return logits: dec_tokens에 대한 다음 토큰 예측 결과 logits
+            """
+            enc_tokens, dec_tokens = inputs
+            
+            # encoder self attention mask
+            enc_self_mask = get_pad_mask(enc_tokens, self.i_pad)
+            # decoder self attention mask
+            dec_self_mask = get_causal_mask(dec_tokens, self.i_pad)
+            # encoder and decoder attention mask
+            enc_dec_mask = get_pad_mask(enc_tokens, self.i_pad)
+    
+            # enc_tokens, dec_tokens embedding lookup
+            enc_hidden = self.embedding(enc_tokens) + self.position(enc_tokens)
+            enc_hidden = self.dropout(enc_hidden, training=training)
+            # call encoder layers
+            for encoder_layer in self.encoder_layers:
+                enc_hidden = encoder_layer(enc_hidden, enc_self_mask, training)
+            
+            # dec_tokens embedding lookup
+            dec_hidden = self.embedding(dec_tokens) + self.position(dec_tokens)
+            dec_hidden = self.dropout(dec_hidden, training=training)
+            # call decoder layers
+            for decoder_layer in self.decoder_layers:
+                dec_hidden = decoder_layer(dec_hidden, enc_hidden, dec_self_mask, enc_dec_mask, training)
+    
+            return dec_hidden
+    
+    class EncoderLayer(tf.keras.layers.Layer):
+        """
+        Encoder Layer Class
+        """
+        def __init__(self, args, name='encoder_layer'):
+            """
+            생성자
+            :param args: Args 객체
+            :param name: layer name
+            """
+            super().__init__(name=name)
+    
+            self.self_attention = MultiHeadAttention(args)
+            self.norm1 = T5LayerNorm(epsilon=args.norm_eps)
+    
+            self.ffn = PositionWiseFeedForward(args)
+            self.norm2 = T5LayerNorm(epsilon=args.norm_eps)
+    
+            self.dropout = tf.keras.layers.Dropout(args.dropout)
+     
+        def call(self, enc_hidden, self_mask, training):
+            """
+            layer 실행
+            :param enc_hidden: 이전 layer 출력
+            :param self_mask: self attention mask
+            :param training: training flag
+            :return enc_out: EncoderLayer 실행 결과
+            """
+            # self attention
+            self_attn_val = self.self_attention(enc_hidden, enc_hidden, enc_hidden, self_mask)
+            # add and layer normal
+            norm1_val = self.norm1(enc_hidden + self.dropout(self_attn_val, training=training))
+            # feed forward
+            ffn_val = self.ffn(norm1_val)
+            # add and layer normal
+            enc_out = self.norm2(norm1_val + self.dropout(ffn_val, training=training))
+            return enc_out
+    
+    class DecoderLayer(tf.keras.layers.Layer):
+        """
+        Decoder Layer Class
+        """
+        def __init__(self, args, name='decoder_layer'):
+            """
+            생성자
+            :param args: Args 객체
+            :param name: layer name
+            """
+            super().__init__(name=name)
+    
+            self.self_attention = MultiHeadAttention(args)
+            self.norm1 = T5LayerNorm(epsilon=args.norm_eps)
+    
+            self.ende_attn = MultiHeadAttention(args)
+            self.norm2 = T5LayerNorm(epsilon=args.norm_eps)
+    
+            self.ffn = PositionWiseFeedForward(args)
+            self.norm3 = T5LayerNorm(epsilon=args.norm_eps)
+    
+            self.dropout = tf.keras.layers.Dropout(args.dropout)
+    
+        def call(self, dec_hidden, enc_out, self_mask, ende_mask, training):
+            """
+            layer 실행
+            :param dec_hidden: 이전 layer 출력
+            :param enc_out: Encoder final 출력
+            :param self_mask: self attention mask
+            :param ende_mask: Encoder Decoder attention mask
+            :param training: training flag
+            :return dec_out: DecoderLayer 실행 결과
+            """
+            # self attention
+            self_attn_val = self.self_attention(dec_hidden, dec_hidden, dec_hidden, self_mask)
+            # add and layer normal
+            norm1_val = self.norm1(dec_hidden + self.dropout(self_attn_val, training=training))
+    
+            # encoder and decoder attention
+            ende_attn_val = self.ende_attn(norm1_val, enc_out, enc_out, ende_mask)
+            # add and layer normal
+            norm2_val = self.norm2(norm1_val + self.dropout(ende_attn_val, training=training))
+    
+            # feed forward
+            ffn_val = self.ffn(norm2_val)
+            # add and layer normal
+            dec_out = self.norm3(norm2_val + self.dropout(ffn_val, training=training))
+            return dec_out
+    
+    class ScaleDotProductAttention(tf.keras.layers.Layer):
+        """
+        Scale Dot Product Attention Class
+        """
+        def __init__(self, args, name="scale_dot_product_attention"):
+            """
+            생성자
+            :param name: layer name
+            """
+            super().__init__(name=name)
+    
+            self.dropout = tf.keras.layers.Dropout(args.dropout)
+    
+        def call(self, Q, K, V, attn_mask, training):
+            """
+            layer 실행
+            :param Q: Query
+            :param K: Key
+            :param V: Value
+            :param attn_mask: attention mask
+            :param training: training flag
+            :return attn_out: attention 실행 결과
+            """
+            # matmul Q, K.T
+            attn_score = tf.matmul(Q, K, transpose_b=True)
+            # d_k
+            d_k = tf.cast(tf.shape(K)[-1], tf.float32)
+            # scale = d_k ** 0.5
+            scale = tf.math.sqrt(d_k)
+            # divide by scale
+            attn_scale = tf.math.divide(attn_score, scale)
+            # do mask (subtract 1e-9 for masked value)
+            attn_scale -= 1.e9 * attn_mask
+            # calculate attention prob
+            attn_prob = tf.nn.softmax(attn_scale, axis=-1)
+            attn_prob = self.dropout(attn_prob, training=training)
+            # weighted sum of V
+            attn_out = tf.matmul(attn_prob, V)
+            return attn_out
+    
+    class MultiHeadAttention(tf.keras.layers.Layer):
+        """
+        Multi Head Attention Class
+        """
+        def __init__(self, args, name="multi_head_attention"):
+            """
+            생성자
+            :param args: Args 객체
+            :param name: layer name
+            """
+            super().__init__(name=name)
+    
+            self.d_model = args.d_model
+            self.n_head = args.n_head
+            self.d_head = args.d_head
+    
+            # Q, K, V input dense layer
+            self.W_Q = build_dense(self.n_head * self.d_head)
+            self.W_K = build_dense(self.n_head * self.d_head)
+            self.W_V = build_dense(self.n_head * self.d_head)
+            # Scale Dot Product Attention class
+            self.attention = ScaleDotProductAttention(args, name="self_attention")
+            # output dense layer
+            self.W_O = build_dense(self.d_model)
+    
+        def call(self, Q, K, V, attn_mask, training):
+            """
+            layer 실행
+            :param Q: Query
+            :param K: Key
+            :param V: Value
+            :param attn_mask: attention mask
+            :param training: training flag
+            :return attn_out: attention 실행 결과
+            """
+            # build multihead Q, K, V
+            Q_m = tf.transpose(tf.reshape(self.W_Q(Q), [-1, tf.shape(Q)[1], args.n_head, args.d_head]), [0, 2, 1, 3])  # (bs, n_head, Q_len, d_head)
+            K_m = tf.transpose(tf.reshape(self.W_K(K), [-1, tf.shape(K)[1], args.n_head, args.d_head]), [0, 2, 1, 3])  # (bs, n_head, Q_len, d_head)
+            V_m = tf.transpose(tf.reshape(self.W_V(V), [-1, tf.shape(V)[1], args.n_head, args.d_head]), [0, 2, 1, 3])  # (bs, n_head, Q_len, d_head)
+            # build multihead mask
+            attn_mask_m = tf.expand_dims(attn_mask, axis=1)
+            # Scale Dot Product Attention with multi head Q, K, V, attn_mask
+            attn_out_m = self.attention(Q_m, K_m, V_m, attn_mask_m, training)  # (bs, n_head, Q_len, d_head)
+            # transpose
+            attn_out_t = tf.transpose(attn_out_m, perm=[0, 2, 1, 3])  # (bs, n_head, Q_len, d_head) -> (bs, Q_len, n_head, d_head)
+            # reshape
+            attn_out_c = tf.reshape(attn_out_t, [-1, tf.shape(Q)[1], args.n_head * args.d_head])  # (bs, Q_len, n_head, d_head) -> (bs, Q_len, n_head * d_head)
+            # linear for output
+            attn_out = self.W_O(attn_out_c) # (bs, Q_len, n_head * d_head) -> (bs, Q_len, d_model)
+            return attn_out
+    
+    class EncoderLayer(tf.keras.layers.Layer):
+        """
+        Encoder Layer Class
+        """
+        def __init__(self, args, name='encoder_layer'):
+            """
+            생성자
+            :param args: Args 객체
+            :param name: layer name
+            """
+            super().__init__(name=name)
+    
+            self.self_attention = MultiHeadAttention(args)
+            self.norm1 = T5LayerNorm(epsilon=args.norm_eps)
+    
+            self.ffn = PositionWiseFeedForward(args)
+            self.norm2 = T5LayerNorm(epsilon=args.norm_eps)
+    
+            self.dropout = tf.keras.layers.Dropout(args.dropout)
+     
+        def call(self, enc_hidden, self_mask, training):
+            """
+            layer 실행
+            :param enc_hidden: 이전 layer 출력
+            :param self_mask: self attention mask
+            :param training: training flag
+            :return enc_out: EncoderLayer 실행 결과
+            """
+            # self attention
+            self_attn_val = self.self_attention(enc_hidden, enc_hidden, enc_hidden, self_mask, training)
+            # add and layer normal
+            norm1_val = self.norm1(enc_hidden + self.dropout(self_attn_val, training=training))
+            # feed forward
+            ffn_val = self.ffn(norm1_val)
+            # add and layer normal
+            enc_out = self.norm2(norm1_val + self.dropout(ffn_val, training=training))
+            return enc_out
+    
+    class DecoderLayer(tf.keras.layers.Layer):
+        """
+        Decoder Layer Class
+        """
+        def __init__(self, args, name='decoder_layer'):
+            """
+            생성자
+            :param args: Args 객체
+            :param name: layer name
+            """
+            super().__init__(name=name)
+    
+            self.self_attention = MultiHeadAttention(args)
+            self.norm1 = T5LayerNorm(epsilon=args.norm_eps)
+    
+            self.ende_attn = MultiHeadAttention(args)
+            self.norm2 = T5LayerNorm(epsilon=args.norm_eps)
+    
+            self.ffn = PositionWiseFeedForward(args)
+            self.norm3 = T5LayerNorm(epsilon=args.norm_eps)
+    
+            self.dropout = tf.keras.layers.Dropout(args.dropout)
+    
+        def call(self, dec_hidden, enc_out, self_mask, ende_mask, training):
+            """
+            layer 실행
+            :param dec_hidden: 이전 layer 출력
+            :param enc_out: Encoder final 출력
+            :param self_mask: self attention mask
+            :param ende_mask: Encoder Decoder attention mask
+            :param training: training flag
+            :return dec_out: DecoderLayer 실행 결과
+            """
+            # self attention
+            self_attn_val = self.self_attention(dec_hidden, dec_hidden, dec_hidden, self_mask, training)
+            # add and layer normal
+            norm1_val = self.norm1(dec_hidden + self.dropout(self_attn_val, training=training))
+    
+            # encoder and decoder attention
+            ende_attn_val = self.ende_attn(norm1_val, enc_out, enc_out, ende_mask, training)
+            # add and layer normal
+            norm2_val = self.norm2(norm1_val + self.dropout(ende_attn_val, training=training))
+    
+            # feed forward
+            ffn_val = self.ffn(norm2_val)
+            # add and layer normal
+            dec_out = self.norm3(norm2_val + self.dropout(ffn_val, training=training))
+            return dec_out
+    
+    class PositionWiseFeedForward(tf.keras.layers.Layer):
+        """
+        Position Wise Feed Forward Class
+        """
+        def __init__(self, args, name="feed_forward"):
+            """
+            생성자
+            :param args: Args 객체
+            :param name: layer name
+            """
+            super().__init__(name=name)
+    
+            self.W_1 = build_dense(args.d_ff, activation=tf.nn.relu)
+            self.W_2 = build_dense(args.d_model)
+    
+            self.dropout = tf.keras.layers.Dropout(args.dropout)
+    
+        def call(self, inputs, training):
+            """
+            layer 실행
+            :param inputs: inputs
+            :param training: training flag
+            :return ff_val: feed forward 실행 결과
+            """
+            # linear W_1 and W_2
+            ff_val = self.W_1(inputs)
+            ff_val = self.dropout(ff_val, training=training)
+            ff_val = self.W_2(ff_val)
+            return ff_val
+    
+    class EncoderLayer(tf.keras.layers.Layer):
+        """
+        Encoder Layer Class
+        """
+        def __init__(self, args, name='encoder_layer'):
+            """
+            생성자
+            :param args: Args 객체
+            :param name: layer name
+            """
+            super().__init__(name=name)
+    
+            self.self_attention = MultiHeadAttention(args)
+            self.norm1 = T5LayerNorm(epsilon=args.norm_eps)
+    
+            self.ffn = PositionWiseFeedForward(args)
+            self.norm2 = T5LayerNorm(epsilon=args.norm_eps)
+    
+            self.dropout = tf.keras.layers.Dropout(args.dropout)
+     
+        def call(self, enc_hidden, self_mask, training):
+            """
+            layer 실행
+            :param enc_hidden: 이전 layer 출력
+            :param self_mask: self attention mask
+            :param training: training flag
+            :return enc_out: EncoderLayer 실행 결과
+            """
+            # self attention
+            self_attn_val = self.self_attention(enc_hidden, enc_hidden, enc_hidden, self_mask, training)
+            # add and layer normal
+            norm1_val = self.norm1(enc_hidden + self.dropout(self_attn_val, training=training))
+            # feed forward
+            ffn_val = self.ffn(norm1_val, training)
+            # add and layer normal
+            enc_out = self.norm2(norm1_val + self.dropout(ffn_val, training=training))
+            return enc_out
+    
+    class DecoderLayer(tf.keras.layers.Layer):
+        """
+        Decoder Layer Class
+        """
+        def __init__(self, args, name='decoder_layer'):
+            """
+            생성자
+            :param args: Args 객체
+            :param name: layer name
+            """
+            super().__init__(name=name)
+    
+            self.self_attention = MultiHeadAttention(args)
+            self.norm1 = T5LayerNorm(epsilon=args.norm_eps)
+    
+            self.ende_attn = MultiHeadAttention(args)
+            self.norm2 = T5LayerNorm(epsilon=args.norm_eps)
+    
+            self.ffn = PositionWiseFeedForward(args)
+            self.norm3 = T5LayerNorm(epsilon=args.norm_eps)
+    
+            self.dropout = tf.keras.layers.Dropout(args.dropout)
+    
+        def call(self, dec_hidden, enc_out, self_mask, ende_mask, training):
+            """
+            layer 실행
+            :param dec_hidden: 이전 layer 출력
+            :param enc_out: Encoder final 출력
+            :param self_mask: self attention mask
+            :param ende_mask: Encoder Decoder attention mask
+            :param training: training flag
+            :return dec_out: DecoderLayer 실행 결과
+            """
+            # self attention
+            self_attn_val = self.self_attention(dec_hidden, dec_hidden, dec_hidden, self_mask, training)
+            # add and layer normal
+            norm1_val = self.norm1(dec_hidden + self.dropout(self_attn_val, training=training))
+    
+            # encoder and decoder attention
+            ende_attn_val = self.ende_attn(norm1_val, enc_out, enc_out, ende_mask, training)
+            # add and layer normal
+            norm2_val = self.norm2(norm1_val + self.dropout(ende_attn_val, training=training))
+    
+            # feed forward
+            ffn_val = self.ffn(norm2_val, training)
+            # add and layer normal
+            dec_out = self.norm3(norm2_val + self.dropout(ffn_val, training=training))
+            return dec_out
+    
+    class ScaleDotProductAttention(tf.keras.layers.Layer):
+        """
+        Scale Dot Product Attention Class
+        """
+        def __init__(self, args, name="scale_dot_product_attention"):
+            """
+            생성자
+            :param name: layer name
+            """
+            super().__init__(name=name)
+    
+            self.dropout = tf.keras.layers.Dropout(args.dropout)
+    
+        def call(self, Q, K, V, attn_mask, attn_pos, training):
+            """
+            layer 실행
+            :param Q: Query
+            :param K: Key
+            :param V: Value
+            :param attn_mask: attention mask
+            :param attn_pos: attention relative position
+            :param training: training flag
+            :return attn_out: attention 실행 결과
+            """
+            # matmul Q, K.T
+            attn_score = tf.matmul(Q, K, transpose_b=True)
+            # d_k
+            d_k = tf.cast(tf.shape(K)[-1], tf.float32)
+            # scale = d_k ** 0.5
+            scale = tf.math.sqrt(d_k)
+            # divide by scale
+            attn_scale = tf.math.divide(attn_score, scale)
+            # do mask (subtract 1e-9 for masked value)
+            attn_scale -= 1.e9 * attn_mask
+            attn_scale += attn_pos
+            # calculate attention prob
+            attn_prob = tf.nn.softmax(attn_scale, axis=-1)
+            attn_prob = self.dropout(attn_prob, training=training)
+            # weighted sum of V
+            attn_out = tf.matmul(attn_prob, V)
+            return attn_out
+    
+    class MultiHeadAttention(tf.keras.layers.Layer):
+        """
+        Multi Head Attention Class
+        """
+        def __init__(self, args, name="multi_head_attention"):
+            """
+            생성자
+            :param args: Args 객체
+            :param name: layer name
+            """
+            super().__init__(name=name)
+    
+            self.d_model = args.d_model
+            self.n_head = args.n_head
+            self.d_head = args.d_head
+    
+            # Q, K, V input dense layer
+            self.W_Q = build_dense(self.n_head * self.d_head)
+            self.W_K = build_dense(self.n_head * self.d_head)
+            self.W_V = build_dense(self.n_head * self.d_head)
+            # Scale Dot Product Attention class
+            self.attention = ScaleDotProductAttention(args, name="self_attention")
+            # output dense layer
+            self.W_O = build_dense(self.d_model)
+    
+        def call(self, Q, K, V, attn_mask, attn_pos, training):
+            """
+            layer 실행
+            :param Q: Query
+            :param K: Key
+            :param V: Value
+            :param attn_mask: attention mask
+            :param attn_pos: attention relative position
+            :param training: training flag
+            :return attn_out: attention 실행 결과
+            """
+            # build multihead Q, K, V
+            Q_m = tf.transpose(tf.reshape(self.W_Q(Q), [-1, tf.shape(Q)[1], args.n_head, args.d_head]), [0, 2, 1, 3])  # (bs, n_head, Q_len, d_head)
+            K_m = tf.transpose(tf.reshape(self.W_K(K), [-1, tf.shape(K)[1], args.n_head, args.d_head]), [0, 2, 1, 3])  # (bs, n_head, Q_len, d_head)
+            V_m = tf.transpose(tf.reshape(self.W_V(V), [-1, tf.shape(V)[1], args.n_head, args.d_head]), [0, 2, 1, 3])  # (bs, n_head, Q_len, d_head)
+            # build multihead mask
+            attn_mask_m = tf.expand_dims(attn_mask, axis=1)
+            # Scale Dot Product Attention with multi head Q, K, V, attn_mask
+            attn_out_m = self.attention(Q_m, K_m, V_m, attn_mask_m, attn_pos, training)  # (bs, n_head, Q_len, d_head)
+            # transpose
+            attn_out_t = tf.transpose(attn_out_m, perm=[0, 2, 1, 3])  # (bs, n_head, Q_len, d_head) -> (bs, Q_len, n_head, d_head)
+            # reshape
+            attn_out_c = tf.reshape(attn_out_t, [-1, tf.shape(Q)[1], args.n_head * args.d_head])  # (bs, Q_len, n_head, d_head) -> (bs, Q_len, n_head * d_head)
+            # linear for output
+            attn_out = self.W_O(attn_out_c) # (bs, Q_len, n_head * d_head) -> (bs, Q_len, d_model)
+            return attn_out
+    
+    class EncoderLayer(tf.keras.layers.Layer):
+        """
+        Encoder Layer Class
+        """
+        def __init__(self, args, name='encoder_layer'):
+            """
+            생성자
+            :param args: Args 객체
+            :param name: layer name
+            """
+            super().__init__(name=name)
+    
+            self.self_attention = MultiHeadAttention(args)
+            self.norm1 = T5LayerNorm(epsilon=args.norm_eps)
+    
+            self.ffn = PositionWiseFeedForward(args)
+            self.norm2 = T5LayerNorm(epsilon=args.norm_eps)
+    
+            self.dropout = tf.keras.layers.Dropout(args.dropout)
+     
+        def call(self, enc_hidden, self_mask, self_pos, training):
+            """
+            layer 실행
+            :param enc_hidden: 이전 layer 출력
+            :param self_mask: self attention mask
+            :param self_pos: self attention relative position
+            :param training: training flag
+            :return enc_out: EncoderLayer 실행 결과
+            """
+            # self attention
+            self_attn_val = self.self_attention(enc_hidden, enc_hidden, enc_hidden, self_mask, self_pos, training)
+            # add and layer normal
+            norm1_val = self.norm1(enc_hidden + self.dropout(self_attn_val, training=training))
+            # feed forward
+            ffn_val = self.ffn(norm1_val, training)
+            # add and layer normal
+            enc_out = self.norm2(norm1_val + self.dropout(ffn_val, training=training))
+            return enc_out
+    
+    class DecoderLayer(tf.keras.layers.Layer):
+        """
+        Decoder Layer Class
+        """
+        def __init__(self, args, name='decoder_layer'):
+            """
+            생성자
+            :param args: Args 객체
+            :param name: layer name
+            """
+            super().__init__(name=name)
+    
+            self.self_attention = MultiHeadAttention(args)
+            self.norm1 = T5LayerNorm(epsilon=args.norm_eps)
+    
+            self.ende_attn = MultiHeadAttention(args)
+            self.norm2 = T5LayerNorm(epsilon=args.norm_eps)
+    
+            self.ffn = PositionWiseFeedForward(args)
+            self.norm3 = T5LayerNorm(epsilon=args.norm_eps)
+    
+            self.dropout = tf.keras.layers.Dropout(args.dropout)
+    
+        def call(self, dec_hidden, enc_out, self_mask, ende_mask, self_pos, ende_pos, training):
+            """
+            layer 실행
+            :param dec_hidden: 이전 layer 출력
+            :param enc_out: Encoder final 출력
+            :param self_mask: self attention mask
+            :param ende_mask: Encoder Decoder attention mask
+            :param self_pos: self attention relative position
+            :param ende_pos: Encoder Decoder attention relative position
+            :param training: training flag
+            :return dec_out: DecoderLayer 실행 결과
+            """
+            # self attention
+            self_attn_val = self.self_attention(dec_hidden, dec_hidden, dec_hidden, self_mask, self_pos, training)
+            # add and layer normal
+            norm1_val = self.norm1(dec_hidden + self.dropout(self_attn_val, training=training))
+    
+            # encoder and decoder attention
+            ende_attn_val = self.ende_attn(norm1_val, enc_out, enc_out, ende_mask, ende_pos, training)
+            # add and layer normal
+            norm2_val = self.norm2(norm1_val + self.dropout(ende_attn_val, training=training))
+    
+            # feed forward
+            ffn_val = self.ffn(norm2_val, training)
+            # add and layer normal
+            dec_out = self.norm3(norm2_val + self.dropout(ffn_val, training=training))
+            return dec_out
+    
+    class T5(tf.keras.Model):
+        """
+        T5 Class
+        """
+        def __init__(self, args, name='T5'):
+            """
+            생성자
+            :param args: Args 객체
+            :param name: layer name
+            """
+            super().__init__(name=name)
+    
+            self.i_pad = args.i_pad
+            self.embedding = SharedEmbedding(args)
+            self.position = PositionalEmbedding(args)
+            
+            self.encoder_layers = [EncoderLayer(args, name=f'encoder_layer_{i}') for i in range(args.n_layer)]
+            self.decoder_layers = [DecoderLayer(args, name=f'decoder_layer_{i}') for i in range(args.n_layer)]
+    
+            self.dropout = tf.keras.layers.Dropout(args.dropout)
+    
+        def call(self, inputs, training=False):
+            """
+            layer 실행
+            :param inputs: enc_tokens, dec_tokens
+            :return logits: dec_tokens에 대한 다음 토큰 예측 결과 logits
+            """
+            enc_tokens, dec_tokens = inputs
+    
+            enc_len = tf.shape(enc_tokens)[1]
+            dec_len = tf.shape(dec_tokens)[1]
+            
+            # encoder self attention mask
+            enc_self_mask = get_pad_mask(enc_tokens, self.i_pad)
+            enc_self_pos = self.position(enc_len, enc_len)
+            # decoder self attention mask
+            dec_self_mask = get_causal_mask(dec_tokens, self.i_pad)
+            dec_self_pos = self.position(dec_len, dec_len)
+            # encoder and decoder attention mask
+            enc_dec_mask = get_pad_mask(enc_tokens, self.i_pad)
+            enc_dec_pos = self.position(dec_len, enc_len)
+    
+            # enc_tokens, dec_tokens embedding lookup
+            enc_hidden = self.embedding(enc_tokens)
+            enc_hidden = self.dropout(enc_hidden, training=training)
+            # call encoder layers
+            for encoder_layer in self.encoder_layers:
+                enc_hidden = encoder_layer(enc_hidden, enc_self_mask, enc_self_pos, training)
+            
+            # dec_tokens embedding lookup
+            dec_hidden = self.embedding(dec_tokens)
+            dec_hidden = self.dropout(dec_hidden, training=training)
+            # call decoder layers
+            for decoder_layer in self.decoder_layers:
+                dec_hidden = decoder_layer(dec_hidden, enc_hidden, dec_self_mask, enc_dec_mask, dec_self_pos, enc_dec_pos, training)
+    
+            return dec_hidden
+    
+    class SharedEmbedding(tf.keras.layers.Layer):
+        """
+        Weighed Shaed Embedding Class
+        """
+        def __init__(self, args, name='weight_shared_embedding'):
+            """
+            생성자
+            :param args: Args 객체
+            :param name: layer name
+            """
+            super().__init__(name=name)
+    
+            self.n_vocab = args.n_vocab
+            self.d_model = args.d_model
+        
+        def build(self, input_shape):
+            """
+            shared weight 생성
+            :param input_shape: Tensor Shape (not used)
+            """
+            with tf.name_scope('shared_embedding_weight'):
+                self.shared_weights = self.add_weight(
+                    'weights',
+                    shape=[self.n_vocab, self.d_model],
+                    initializer=kernel_initializer()
+                )
+    
+        def call(self, inputs, mode='embedding'):
+            """
+            layer 실행
+            :param inputs: 입력
+            :param mode: 실행 모드
+            :return: embedding or linear 실행 결과
+            """
+            # mode가 embedding일 경우 embedding lookup 실행
+            if mode == 'embedding':
+                return self._embedding(inputs)
+            # mode가 linear일 경우 linear 실행
+            elif mode == 'linear':
+                return self._linear(inputs)
+            # mode가 기타일 경우 오류 발생
+            else:
+                raise ValueError(f'mode {mode} is not valid.')
+        
+        def _embedding(self, inputs):
+            """
+            embedding lookup
+            :param inputs: 입력
+            """
+            # lookup by gather
+            embed = tf.gather(self.shared_weights, tf.cast(inputs, tf.int32))
+            return embed
+    
+        def _linear(self, inputs):  # (bs, n_seq, d_model)
+            """
+            linear 실행
+            :param inputs: 입력
+            """
+            # matmul inputs, shared_weights (transpose_b=True)
+            outputs = tf.matmul(inputs, self.shared_weights, transpose_b=True)
+            return outputs
+    ```

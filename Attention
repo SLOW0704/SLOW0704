@@ -1,0 +1,41 @@
+class NMTAttention(tf.keras.Model):
+    """
+    NMTAttention Class
+    """
+    def __init__(self, args, name='nmt_attention'):
+        """
+        생성자
+        :param args: Args 객체
+        :param name: layer name
+        """
+        super().__init__(name=name)
+
+        self.embedding = tf.keras.layers.Embedding(args.n_vocab, args.d_model, mask_zero=True)
+        self.enc_lstm = tf.keras.layers.LSTM(units=args.d_model, return_sequences=True, return_state=True)
+        self.dec_lstm = tf.keras.layers.LSTM(units=args.d_model, return_sequences=True)
+        self.linear = tf.keras.layers.Dense(args.n_vocab)
+
+    def call(self, inputs, training=False):
+        """
+        layer 실행
+        :param inputs: tokens
+        :return y_pred: tokens 예측 결과
+        """
+        enc_tokens, dec_tokens = inputs
+
+        enc_hidden = self.embedding(enc_tokens)  # (bs, n_seq, d_model)
+        enc_mask = self.embedding.compute_mask(enc_tokens)
+        enc_hidden, enc_h_state, enc_c_state = self.enc_lstm(enc_hidden, mask=enc_mask)
+
+        dec_hidden = self.embedding(dec_tokens)  # (bs, n_seq, d_model)
+        dec_mask = self.embedding.compute_mask(dec_tokens)
+        dec_hidden = self.dec_lstm(dec_hidden, initial_state=[enc_h_state, enc_c_state], mask=dec_mask)
+
+        attn_score = tf.matmul(dec_hidden, enc_hidden, transpose_b=True)
+        attn_prob = tf.nn.softmax(attn_score, axis=-1)
+        attn_out = tf.matmul(attn_prob, enc_hidden)
+
+        cat_hidden = tf.concat([attn_out, dec_hidden], axis=-1)
+        logits = self.linear(cat_hidden)
+
+        return logits

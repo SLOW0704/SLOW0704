@@ -1,0 +1,107 @@
+#
+# char
+#
+
+char_counter = collections.Counter()
+# char 개수 확인
+with zipfile.ZipFile(args.corpus) as z:
+    with z.open('kowiki.txt') as f:
+        for line in tqdm(f, total=total_count):
+            line = line.decode('utf-8').strip()
+            char_counter.update(list(line))
+
+
+# char에 일련번호 부여
+char_to_id = {'[PAD]': 0, '[UNK]': 1}
+for c, cnt in char_counter.items():
+    char_to_id[c] = len(char_to_id)
+print(len(char_to_id))
+
+
+# wiki char tokenize
+with zipfile.ZipFile(args.corpus) as z:
+    with z.open('kowiki.txt') as f:
+        for i, line in enumerate(f):
+            if i >= 5:
+                break
+            line = line.decode('utf-8').strip()
+            _id = [char_to_id.get(c, 1) for c in line]
+            print(_id)
+
+#
+# word
+#
+
+word_counter = collections.Counter()
+# word 개수 확인
+with zipfile.ZipFile(args.corpus) as z:
+    with z.open('kowiki.txt') as f:
+        for line in tqdm(f, total=total_count):
+            line = line.decode('utf-8').strip()
+            line = re.sub('([.,!?()·\"\'])', r' \1 ', line)
+            word_counter.update(line.split())
+
+# word에 일련번호 부여
+word_to_id = {'[PAD]': 0, '[UNK]': 1}
+for w, cnt in word_counter.items():
+    word_to_id[w] = len(word_to_id)
+print(len(word_to_id))
+
+# wiki word tokenize
+with zipfile.ZipFile(args.corpus) as z:
+    with z.open('kowiki.txt') as f:
+        for i, line in enumerate(f):
+            if i >= 5:
+                break
+            line = line.decode('utf-8').strip()
+            line = re.sub('([.,!?()·\"\'])', r' \1 ', line)
+            _id = [word_to_id.get(w, 1) for w in line.split()]
+            print(_id)
+
+
+morph_counter = collections.Counter()
+# morph 개수 확인
+with zipfile.ZipFile(args.corpus) as z:
+    with z.open('kowiki.txt') as f:
+        for i, line in enumerate(tqdm(f, total=total_count)):
+            line = line.decode('utf-8').strip()
+            morph_counter.update(mecab.morphs(line))
+
+# morph에 일련번호 부여
+morph_to_id = {'[PAD]': 0, '[UNK]': 1}
+for w, cnt in morph_counter.items():
+    morph_to_id[w] = len(morph_to_id)
+print(len(morph_to_id))
+
+# wiki morph tokenize
+with zipfile.ZipFile(args.corpus) as z:
+    with z.open('kowiki.txt') as f:
+        for i, line in enumerate(f):
+            if i >= 5:
+                break
+            line = line.decode('utf-8').strip()
+            tokens = mecab.morphs(line)
+            print(tokens)
+            _id = [morph_to_id.get(w, 1) for w in tokens]
+            print(_id)
+
+#
+# spm
+#
+
+# wiki spm tokenize
+with zipfile.ZipFile(args.corpus) as z:
+    with z.open('kowiki.txt') as f:
+        for i, line in enumerate(f):
+            if i >= 5:
+                break
+            line = line.decode('utf-8').strip()
+            print(spm_vocab.encode_as_pieces(line))
+            print(spm_vocab.encode_as_ids(line))
+
+tokens = spm_vocab.encode_as_pieces(text)
+spm_vocab.decode_pieces(tokens)
+_ids = spm_vocab.encode_as_ids(text)
+spm_vocab.decode_ids(_ids)
+spm_vocab.piece_to_id(tokens)
+spm_vocab.id_to_piece(_ids)

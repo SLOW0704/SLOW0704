@@ -1,0 +1,43 @@
+class TokenClassifier(tf.keras.Model):
+    """
+    TokenClassifier Class
+    """
+    def __init__(self, args, name='token_classifier'):
+        """
+        생성자
+        :param args: Args 객체
+        :param name: layer name
+        """
+        super().__init__(name=name)
+
+        self.embedding = tf.keras.layers.Embedding(args.n_vocab, args.d_model)
+        self.linear = tf.keras.layers.Dense(args.n_out)
+
+    def call(self, inputs, training=False):
+        """
+        layer 실행
+        :param inputs: tokens
+        :param training: training flag
+        :return logits: tokens 예측 결과
+        """
+        tokens = inputs
+
+        hidden = self.embedding(tokens)
+        # RNN, CNN, Attetion
+        logits = self.linear(hidden)
+
+        return logits
+
+
+logits = model(train_tokens[:4])
+logits, train_labels[:4]
+
+y_pred_nl = np.log(1 / y_pred)
+y_pred_nl, -np.log(y_pred)
+
+np.mean(np.sum(y_true * y_pred_nl, axis=-1))
+
+tf.keras.losses.CategoricalCrossentropy()(y_true, y_pred)
+tf.keras.losses.CategoricalCrossentropy(from_logits=True)(y_true, logits)
+tf.keras.losses.SparseCategoricalCrossentropy()(train_labels, y_pred)
+tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True)(train_labels, logits)
